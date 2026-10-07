@@ -148,7 +148,7 @@ claude mcp login websearch   # Claude Code の中で /mcp から認証しても�
 
 ログインの流れは次のとおりです。
 
-1. Claude Code が Gateway に接続すると 401 が返り、Gateway の OAuth メタデータ（`/.well-known/oauth-protected-resource`）から Cognito が認可サーバーだと分かります。利用者が設定するのはクライアント ID だけです
+1. Claude Code が Gateway に接続すると 401 が返り、Gateway の OAuth メタデータ（`/.well-known/oauth-protected-resource`）から認可サーバーとして Cognito が検出されます。利用者が設定する項目はクライアント ID です
 2. ブラウザで Cognito のログイン画面が開きます。招待メールの仮パスワードで初回ログインすると、新しいパスワードの設定を求められます
 3. ログインすると `http://localhost:53280/callback` にリダイレクトされ、Claude Code がトークンを受け取ります。ブラウザはそのまま閉じて構いません
 4. アクセストークンは 1 時間で切れ、リフレッシュトークン（7 日）で自動更新されます。リフレッシュトークンが切れたら、もう一度ログインします
@@ -168,7 +168,7 @@ Cognito は動的クライアント登録に対応していないため、クラ
 | --- | --- |
 | `web-search___WebSearch` | `query`（必須、200 文字以内）、`maxResults`（1〜25、既定 10）、`filters.domainFilter.include/exclude`、`filters.publishedDateFilter.from/to` |
 
-検索結果には本文の抜粋、URL、タイトル、公開日が含まれます。利用規約上、結果をユーザーへ表示する際は出典 URL を残す必要があります。
+検索結果には本文の抜粋、URL、タイトル、公開日が含まれます。
 
 ## 運用
 
@@ -176,7 +176,7 @@ Cognito は動的クライアント登録に対応していないため、クラ
 
 `allowedIps` を指定すると、許可リスト外の送信元からの呼び出しを拒否します。IAM 方式では Gateway のリソースポリシーに明示的な Deny を付けるので、管理者権限を持つ呼び出し元も拒否され、追加料金はかかりません。Cognito 方式と API Key 方式では WAF の IP セットで遮断します。WAF の固定費は月 $6 程度です。
 
-- Cognito 方式（JWT 認証）でリソースポリシーの `aws:SourceIp` 条件を使うと、許可リスト内の送信元も含めてすべて拒否されました。JWT 認証のリクエストでは送信元 IP がポリシー評価に使われないためです。そのため Cognito 方式は WAF で制限しています
+- Cognito 方式（JWT 認証）でリソースポリシーの `aws:SourceIp` 条件を使うと、JWT 認証のリクエストでは送信元 IP がポリシー評価に使われないため、許可リスト内の送信元も含めてすべて拒否されました
 
 - 許可する IP は、AWS から見える送信元 IP で指定してください。VPN や Cloudflare WARP などを経由すると、`curl https://checkip.amazonaws.com` の結果が接続のたびに変わることがあります。CloudTrail の `sourceIPAddress` でも確認できます
 - 2026 年 10 月時点では Gateway のエンドポイントに AAAA レコードがなく、IPv4 でしか接続できません。IPv6 の CIDR も指定できるので、エンドポイントがデュアルスタックに対応すればそのまま有効になります
