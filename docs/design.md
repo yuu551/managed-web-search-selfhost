@@ -102,7 +102,9 @@ Amazon Bedrock AgentCore Gateway の Web Search Tool（マネージドConnector�
 | 対策 | 対象 | 効果 | コスト |
 | --- | --- | --- | --- |
 | AWS WAF の IP 単位レート制限（`AWS::WAFv2::WebACLAssociation` で関連付け） | API Key 方式（既定で有効、`enableWaf=false` で無効化） | Gateway より手前で遮断し、DDoS 時の単価を約 1/9 に下げる | Web ACL とルールで月 $6 程度、加えて $0.60/100 万リクエスト |
-| Gateway のレート制限（`AWS::BedrockAgentCore::GatewayRateLimit`、`toolName` 単位） | 全方式 | WebSearch の呼び出し回数に上限をかけ、キー漏えい時も検索料金が青天井にならない | 追加料金なし |
+| Gateway のレート制限（`AWS::BedrockAgentCore::GatewayRateLimit`、`toolName` 単位） | 全方式 | WebSearch の呼び出し回数に上限をかけ、キー漏えい時も検索料金が際限なく増えないようにする | 追加料金なし |
+
+Web Search は 1,000 クエリあたり $7 なので、既定の上限（1 分あたり 60 回）まで使い続けると 1 時間で約 $25、1 日で約 $600 になる。上限は利用量に合わせて `searchesPerMinute` で下げ、AWS Budgets のアラートと併用する。
 
 Gateway の `WebAclArn` プロパティは読み取り専用なので、関連付けは `WebACLAssociation` リソースで行う。Gateway のレート制限は fail-open なので、これだけをセキュリティ境界にはしない。
 
@@ -111,3 +113,52 @@ Gateway の `WebAclArn` プロパティは読み取り専用なので、関連�
 - ユニット: Interceptor のキー検証ロジック、CIDR の振り分け（vitest）
 - スナップショットではなくアサーション: CDK テンプレートに必要なリソース・権限・設定があるか（vitest + `aws-cdk-lib/assertions`）
 - E2E: `pnpm smoke` で、デプロイ済みの各 Gateway に MCP クライアントとして接続して検証する。Cognito 方式のログインは、`COGNITO_TEST_USERNAME` / `COGNITO_TEST_PASSWORD` を渡したときだけホスト型ログイン画面経由でトークンを取得して試す
+
+## 運用手順
+
+### Cognito 方式のログインの流れ
+
+1. MCP クライアントが Gateway に接続すると 401 が返り、`/.well-known/oauth-protected-resource` から認可サーバーとして Cognito が検出される。利用者が設定する項目はクライアント ID
+2. ブラウザで Cognito のログイン画面が開く。招待メールの仮パスワードで初回ログインすると、新しいパスワードの設定を求められる
+3. ログインすると `http://localhost:53280/callback` にリダイレクトされ、クライアントがトークンを受け取る
+4. アクセストークンは 1 時間で切れ、リフレッシュトークン（7 日）で自動更新される。リフレッシュトークンが切れたら再ログインする
+
+Claude Code ではコマンドからもログインできる。
+
+```bash
+claude mcp login websearch
+```
+
+利用を止めるときは、ユーザーを無効化してサインアウトさせる。発行済みのアクセストークンは期限（最大 1 時間）まで使える。
+
+```bash
+aws cognito-idp admin-disable-user --user-pool-id <CognitoUserPoolId> --username user@example.com
+aws cognito-idp admin-user-global-sign-out --user-pool-id <CognitoUserPoolId> --username user@example.com
+```
+
+### API Key の追加・ローテーション
+
+シークレットにはカンマ区切りで複数のキーを登録できる。Interceptor がシークレットを 5 分間キャッシュするので、反映には最大 5 分かかる。
+
+```bash
+SECRET_ARN=$(jq -r .ManagedWebSearch.ApiKeySecretArn cdk-outputs.json)
+NEW_KEY=$(openssl rand -hex 24)
+CURRENT=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --query SecretString --output text)
+aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --secret-string "$CURRENT,$NEW_KEY"
+```
+
+stdio しか使えないクライアント（Claude Desktop など）からは `mcp-remote` で中継する。設定例は `pnpm mcp-config` で出力される。
+
+### IP 制限で許可するアドレス
+
+- AWS から見える送信元 IP で指定する。VPN や Cloudflare WARP などを経由すると出口 IP が複数あり、`curl https://checkip.amazonaws.com` の結果が変わることがある。CloudTrail の `sourceIPAddress` でも確認できる
+- 2026 年 10 月時点では Gateway のエンドポイントに AAAA レコードがなく、IPv4 でしか接続できない
+
+### E2E テスト
+
+Cognito 方式のログインまで試す場合は、テスト用ユーザーの認証情報を渡す。
+
+```bash
+COGNITO_TEST_USERNAME=user@example.com COGNITO_TEST_PASSWORD='...' pnpm smoke
+```
+
