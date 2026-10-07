@@ -5,17 +5,21 @@ Amazon Bedrock AgentCore Gateway のマネージド Web Search Tool を CDK で�
 - 検索インデックスは Amazon 側で運用されており、検索クエリは AWS の外に出ません
 - 外部の検索 API を契約したり、サーバーを独自に管理したりする負担がありません
 - 認証方式は IAM 方式と API Key 方式の2通りに対応しています。標準では IAM 方式を作成し、API Key 方式も用意する場合は `-c authModes=apikey,iam` を指定します
-  - API Key 方式: URL とヘッダーを設定すれば、幅広いクライアントからそのまま接続できます
+  - API Key 方式: URL とヘッダーを設定すれば、幅広いクライアントからそのまま接続できます。ただし推奨しません（理由は [API Key 方式](#api-key-方式) を参照）
   - IAM 方式: `awsume` などの AWS 認証情報をそのまま使うため、シークレットの管理が不要です
 
 設計の詳細は [docs/design.md](docs/design.md) にまとめています。
 
 ## 構成
 
-```
-MCP クライアント ──Bearer──▶ Gateway (NONE + Interceptor λ で API Key 検証, WAF) ─┐
-MCP クライアント ──SigV4──▶ Gateway (AWS_IAM) ───────────────────────────────────┴─▶ Web Search Connector
-```
+![構成図](docs/images/architecture.png)
+
+図の元データは [docs/images/architecture.drawio](docs/images/architecture.drawio) です。
+
+## 注意事項
+
+- **API Key 方式はあまり推奨しません。** Gateway を認証なし（`NONE`）で公開し、キーの検証を Interceptor Lambda に任せる構成です。キーが漏れると誰でも検索でき、誤ったキーのリクエストにも Gateway と Lambda の料金がかかります。AWS の認証情報を使える環境では IAM 方式を使ってください
+- 検索結果をユーザーに表示するときは、利用規約に従って出典 URL を残してください。検索結果を大量に保存・複製する用途や、競合する検索インデックスを作る用途には使えません
 
 ## 前提
 
@@ -66,6 +70,9 @@ pnpm mcp-config --with-key  # API Key を埋め込んで表示
 ```
 
 ### API Key 方式
+
+> [!WARNING]
+> API Key 方式はあまり推奨しません。Gateway 自体は認証なし（`NONE`）で公開され、キーの検証を Interceptor Lambda に任せる構成のため、キーが漏れると誰でも検索できます。また、誤ったキーのリクエストも Gateway と Lambda の課金対象になり、対策の WAF には固定費がかかります。AWS の認証情報を使える環境では IAM 方式を使ってください。
 
 Streamable HTTP に対応したクライアントでは、URL とヘッダーを指定します。ヘッダーには `Authorization: Bearer <key>` または `x-api-key: <key>` を設定します。
 

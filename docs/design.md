@@ -37,7 +37,10 @@ Amazon Bedrock AgentCore Gateway の Web Search Tool（マネージドConnector�
                                                Web Search Connector (AWS内で完結)
 ```
 
-### 方式1: API Key（メイン）
+### 方式1: API Key（オプション、非推奨）
+
+既定では作らない。Gateway を認証なしで公開するため、キー漏えいとゴミリクエストの課金リスクがあり、対策の WAF に固定費もかかる。AWS 認証情報を使えないクライアント向けの逃げ道として残している。
+
 
 - `authorizerType: NONE` と REQUEST interceptor（Lambda）を組み合わせる。公式ドキュメントで「offloaded authorization」として紹介されている構成
 - Interceptor は `passRequestHeaders: true` でヘッダーを受け取り、`Authorization: Bearer <key>` または `x-api-key: <key>` を Secrets Manager の値と定数時間で比較する
@@ -46,7 +49,7 @@ Amazon Bedrock AgentCore Gateway の Web Search Tool（マネージドConnector�
 - Lambda はシークレットを5分間キャッシュする
 - URL とヘッダーを設定できるMCPクライアントなら追加ツールなしで繋がる
 
-### 方式2: IAM（AWSユーザー向け）
+### 方式2: IAM（既定、推奨）
 
 - `authorizerType: AWS_IAM`。呼び出し側に `bedrock-agentcore:InvokeGateway` が必要
 - クライアントからは `uvx mcp-proxy-for-aws@latest <url> --service bedrock-agentcore --region <region>` を stdio MCP サーバーとして登録する
