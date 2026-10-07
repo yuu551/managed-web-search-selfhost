@@ -1,0 +1,7 @@
+{
+  "app": "npx tsx bin/app.ts",
+  "watch": { "include": ["bin/**", "lib/**", "lambda/**"] },
+  "context": {
+    "@aws-cdk/aws-iam:minimizePolicies": true
+  }
+}
