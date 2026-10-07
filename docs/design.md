@@ -18,24 +18,9 @@ Amazon Bedrock AgentCore Gateway の Web Search Tool（マネージドConnector�
 
 ## アーキテクチャ
 
-用途に合わせて Gateway を2つ作る。Gateway 自体に固定費はなく、課金は呼び出し単位。
+認証方式ごとに Gateway を作る。既定では IAM 方式だけを作り、Cognito 方式と API Key 方式は `authModes` で追加する。Gateway 自体に固定費はなく、課金は呼び出し単位。
 
-```
-┌──────────────────────┐   Authorization: Bearer <API Key>
-│ 任意のMCPクライアント  │ ─────────────────────────────┐
-└──────────────────────┘                              ▼
-                                   ┌───────────────────────────────┐   ┌──────────────────┐
-                                   │ Gateway (authorizer: NONE)    │──▶│ Interceptor λ     │
-                                   │  + REQUEST interceptor        │   │ API Key 検証       │
-                                   └───────────────┬───────────────┘   │ (Secrets Manager) │
-                                                   │                   └──────────────────┘
-┌──────────────────────┐   SigV4                   │
-│ AWS認証情報を持つ      │ ──(mcp-proxy-for-aws)──▶ ┌┴──────────────────────────────┐
-│ クライアント           │                          │ Gateway (authorizer: AWS_IAM) │
-└──────────────────────┘                          └───────────────┬───────────────┘
-                                                                  ▼
-                                               Web Search Connector (AWS内で完結)
-```
+![構成図](images/architecture.png)
 
 ### 方式1: API Key（オプション、非推奨）
 
@@ -74,10 +59,10 @@ Amazon Bedrock AgentCore Gateway の Web Search Tool（マネージドConnector�
 
 | ファイル | 役割 |
 | --- | --- |
-| `bin/app.ts` | エントリポイント。context でリージョン・認証方式・除外ドメインを受け取る |
-| `lib/web-search-gateway-stack.ts` | Gateway×2、Web Search Target×2、サービスロール、Interceptor Lambda、Secret、WAF、Gateway レート制限 |
+| `bin/app.ts` | エントリポイント。context で認証方式・除外ドメイン・レート制限・IP 制限・トークン有効期限などを受け取る |
+| `lib/web-search-gateway-stack.ts` | 方式ごとの Gateway と Web Search Target、サービスロール、Gateway レート制限、IP 制限（リソースポリシー / WAF）、Cognito ユーザープール、Interceptor Lambda と Secret、WAF |
 | `lambda/api-key-interceptor/index.ts` | API Key 検証 Interceptor |
-| `scripts/smoke.ts` | デプロイ後のE2Eテスト（両方式で initialize → tools/list → tools/call、不正キーの拒否） |
+| `scripts/smoke.ts` | デプロイ後のE2Eテスト（各方式で initialize → tools/list → tools/call、不正な認証情報の拒否） |
 | `scripts/print-config.ts` | 各MCPクライアント向け設定スニペットの出力 |
 | `scripts/lib.ts` | スタック出力の読み込み、API Key 取得、SigV4 署名付き fetch |
 
@@ -85,7 +70,7 @@ Amazon Bedrock AgentCore Gateway の Web Search Tool（マネージドConnector�
 
 | キー | 既定値 | 説明 |
 | --- | --- | --- |
-| `authModes` | `iam` | 作る Gateway の種類。API Key 方式は WAF の固定費がかかるため既定では作らず、`apikey,iam` を指定したときに作る |
+| `authModes` | `iam` | 作る Gateway の種類（`iam` / `cognito` / `apikey` をカンマ区切り）。Cognito 方式と API Key 方式は既定では作らない |
 | `excludeDomains` | なし | 検索結果から除外するドメイン（カンマ区切り）。Target レベルで強制される |
 | `enableWaf` | `true` | API Key 方式の Gateway に WAF を付けるか |
 | `wafRequestsPer5MinPerIp` | `300` | WAF で許可する 1 IP あたりのリクエスト数（5分間） |
@@ -117,12 +102,12 @@ Amazon Bedrock AgentCore Gateway の Web Search Tool（マネージドConnector�
 | 対策 | 対象 | 効果 | コスト |
 | --- | --- | --- | --- |
 | AWS WAF の IP 単位レート制限（`AWS::WAFv2::WebACLAssociation` で関連付け） | API Key 方式（既定で有効、`enableWaf=false` で無効化） | Gateway より手前で遮断し、DDoS 時の単価を約 1/9 に下げる | Web ACL とルールで月 $6 程度、加えて $0.60/100 万リクエスト |
-| Gateway のレート制限（`AWS::BedrockAgentCore::GatewayRateLimit`、`toolName` 単位） | 両方式 | WebSearch の呼び出し回数に上限をかけ、キー漏えい時も検索料金が青天井にならない | 追加料金なし |
+| Gateway のレート制限（`AWS::BedrockAgentCore::GatewayRateLimit`、`toolName` 単位） | 全方式 | WebSearch の呼び出し回数に上限をかけ、キー漏えい時も検索料金が青天井にならない | 追加料金なし |
 
 Gateway の `WebAclArn` プロパティは読み取り専用なので、関連付けは `WebACLAssociation` リソースで行う。Gateway のレート制限は fail-open なので、これだけをセキュリティ境界にはしない。
 
 ## テスト方針
 
-- ユニット: Interceptor のキー検証ロジック（vitest）
+- ユニット: Interceptor のキー検証ロジック、CIDR の振り分け（vitest）
 - スナップショットではなくアサーション: CDK テンプレートに必要なリソース・権限・設定があるか（vitest + `aws-cdk-lib/assertions`）
-- E2E: `pnpm smoke` で実環境の両 Gateway に MCP クライアントとして接続して検証する
+- E2E: `pnpm smoke` で、デプロイ済みの各 Gateway に MCP クライアントとして接続して検証する。Cognito 方式のログインは、`COGNITO_TEST_USERNAME` / `COGNITO_TEST_PASSWORD` を渡したときだけホスト型ログイン画面経由でトークンを取得して試す

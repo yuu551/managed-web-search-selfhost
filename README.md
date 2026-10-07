@@ -67,6 +67,7 @@ COGNITO_TEST_USERNAME=user@example.com COGNITO_TEST_PASSWORD='...' pnpm smoke
 | `stackName` | `ManagedWebSearch` | スタック名（Gateway 名のプレフィックスにもなる） |
 
 ```bash
+pnpm run deploy -c authModes=iam,cognito  # Cognito 方式も作る
 pnpm run deploy -c authModes=apikey,iam   # API Key 方式も作る（WAF の固定費が月 $6 程度かかる）
 pnpm run deploy -c excludeDomains=example.com,example.net -c searchesPerMinute=30
 pnpm run deploy -c allowedIps=203.0.113.0/24,2001:db8::/32
@@ -195,9 +196,9 @@ aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --secret-string "$
 
 - Gateway 自体に固定費はなく、API 呼び出し（1,000 件あたり $0.005）と Web Search のクエリ数に応じて課金されます。
 - API Key 方式（`NONE` 認証）の Gateway では、誤ったキーのリクエストも Gateway に届いた時点で課金対象になります。認証で拒否されたリクエストでは Web Search は実行されないため検索料金は発生せず、Gateway と Lambda の呼び出し料金（100 万リクエストあたり約 $5）が発生します。
-- 意図しない課金の急増を防ぐため、次の 2 つのレート制限を用意しています。
+- 意図しない課金の急増を防ぐため、次の 2 種類のレート制限を用意しています。
   - WAF による IP 単位のレート制限（API Key 方式の Gateway で既定で有効）。Gateway の手前でリクエストを遮断します。費用は月額約 $6 の固定費と、100 万リクエストあたり $0.60 の従量料金です。
-  - Gateway 本体のレート制限（両方式で有効、追加料金なし）。Web Search の呼び出し回数に上限を設け、キーが漏洩した場合でも検索費用の膨張を防ぎます。
+  - Gateway 本体のレート制限（全方式で有効、追加料金なし）。Web Search の呼び出し回数に上限を設け、キーが漏洩した場合でも検索費用の膨張を防ぎます。
 - 想定外の支出を早期に検知できるよう、AWS Budgets で予算アラートを設定しておくことを推奨します。
 
 ### 削除
