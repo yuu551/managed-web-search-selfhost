@@ -2,6 +2,7 @@ import { isIPv4, isIPv6 } from "node:net";
 import * as path from "node:path";
 import * as cdk from "aws-cdk-lib";
 import * as agentcore from "aws-cdk-lib/aws-bedrockagentcore";
+import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as nodejs from "aws-cdk-lib/aws-lambda-nodejs";
@@ -12,7 +13,7 @@ import { Construct } from "constructs";
 
 export const SUPPORTED_REGIONS = ["us-east-1", "eu-west-1", "ap-northeast-1"];
 
-export type AuthMode = "apikey" | "iam";
+export type AuthMode = "apikey" | "iam" | "cognito";
 
 const TOOL_DESCRIPTION =
   "Search the web for up-to-date information such as recent news, releases, documentation, and facts after your training cutoff. " +
@@ -49,9 +50,15 @@ export interface WebSearchGatewayStackProps extends cdk.StackProps {
   searchesPerMinute?: number;
   /**
    * 接続を許可する送信元 IP（IPv4 / IPv6 の CIDR を混在可）。未指定なら制限しない。
-   * IAM 方式は Gateway のリソースポリシー、API Key 方式は WAF の IP セットで制限する
+   * IAM 方式は Gateway のリソースポリシー（追加料金なし）、API Key 方式と Cognito 方式は WAF の IP セットで制限する
    */
   allowedIps?: string[];
+  /** Cognito 方式の OAuth コールバック URL（MCP クライアントが待ち受ける localhost の URL） @default ["http://localhost:53280/callback"] */
+  oauthCallbackUrls?: string[];
+  /** Cognito 方式のアクセストークンの有効期限（分、5〜1440） @default 60 */
+  accessTokenValidityMinutes?: number;
+  /** Cognito 方式のリフレッシュトークンの有効期限（日）。切れると再ログインになる @default 7 */
+  refreshTokenValidityDays?: number;
 }
 
 export class WebSearchGatewayStack extends cdk.Stack {
@@ -62,7 +69,7 @@ export class WebSearchGatewayStack extends cdk.Stack {
       throw new Error(`Web Search Tool is not available in ${this.region}. Use one of: ${SUPPORTED_REGIONS.join(", ")}`);
     }
     if (props.authModes.length === 0) {
-      throw new Error("authModes must contain at least one of: apikey, iam");
+      throw new Error("authModes must contain at least one of: apikey, iam, cognito");
     }
 
     const role = new iam.Role(this, "GatewayServiceRole", {
@@ -83,6 +90,87 @@ export class WebSearchGatewayStack extends cdk.Stack {
 
     const allowed = classifyCidrs(props.allowedIps ?? []);
     const allowedCidrs = [...allowed.ipv4, ...allowed.ipv6];
+
+    // 明示的な Deny は呼び出し元の権限（管理者を含む）より優先されるため、許可リスト外からは誰も呼び出せない
+    const restrictBySourceIp = (gateway: agentcore.CfnGateway, idPrefix: string) => {
+      if (allowedCidrs.length === 0) return;
+      new agentcore.CfnResourcePolicy(this, `${idPrefix}GatewayResourcePolicy`, {
+        resourceArn: gateway.attrGatewayArn,
+        policy: cdk.Stack.of(this).toJsonString({
+          Version: "2012-10-17",
+          Statement: [
+            {
+              Sid: "DenyNotAllowedIps",
+              Effect: "Deny",
+              Principal: "*",
+              Action: "bedrock-agentcore:InvokeGateway",
+              Resource: gateway.attrGatewayArn,
+              Condition: { NotIpAddress: { "aws:SourceIp": allowedCidrs } },
+            },
+          ],
+        }),
+      });
+    };
+
+    // WAF は Gateway より手前で遮断できる。IP 制限（許可リスト外をブロック）と IP 単位のレート制限を必要な分だけ付ける
+    const attachWaf = (gateway: agentcore.CfnGateway, idPrefix: string, opts: { rateLimit: boolean }) => {
+      const rules: wafv2.CfnWebACL.RuleProperty[] = [];
+      const visibility = (metricName: string) => ({ cloudWatchMetricsEnabled: true, metricName, sampledRequestsEnabled: true });
+
+      if (allowedCidrs.length > 0) {
+        // IP セットは IPv4 と IPv6 で別リソースになる
+        const ipSetRefs = (["IPV4", "IPV6"] as const)
+          .map((version) => ({ version, addresses: version === "IPV4" ? allowed.ipv4 : allowed.ipv6 }))
+          .filter((x) => x.addresses.length > 0)
+          .map(({ version, addresses }) => ({
+            ipSetReferenceStatement: {
+              arn: new wafv2.CfnIPSet(this, `${idPrefix}GatewayAllowed${version}`, {
+                scope: "REGIONAL",
+                ipAddressVersion: version,
+                addresses,
+              }).attrArn,
+            },
+          }));
+        rules.push({
+          name: "BlockNotAllowedIps",
+          priority: 0,
+          action: { block: {} },
+          statement: {
+            notStatement: {
+              statement: ipSetRefs.length === 1 ? ipSetRefs[0] : { orStatement: { statements: ipSetRefs } },
+            },
+          },
+          visibilityConfig: visibility("BlockNotAllowedIps"),
+        });
+      }
+      if (opts.rateLimit) {
+        rules.push({
+          name: "RateLimitPerIp",
+          priority: 1,
+          action: { block: {} },
+          statement: {
+            rateBasedStatement: {
+              aggregateKeyType: "IP",
+              evaluationWindowSec: 300,
+              limit: props.wafRequestsPer5MinPerIp ?? 300,
+            },
+          },
+          visibilityConfig: visibility("RateLimitPerIp"),
+        });
+      }
+      if (rules.length === 0) return;
+
+      const webAcl = new wafv2.CfnWebACL(this, `${idPrefix}GatewayWebAcl`, {
+        scope: "REGIONAL",
+        defaultAction: { allow: {} },
+        visibilityConfig: visibility(`${this.stackName}-${idPrefix.toLowerCase()}-gateway`),
+        rules,
+      });
+      new wafv2.CfnWebACLAssociation(this, `${idPrefix}GatewayWebAclAssociation`, {
+        resourceArn: gateway.attrGatewayArn,
+        webAclArn: webAcl.attrArn,
+      });
+    };
 
     const parameterValues = props.excludeDomains?.length ? { domainFilter: { exclude: props.excludeDomains } } : {};
 
@@ -167,64 +255,7 @@ export class WebSearchGatewayStack extends cdk.Stack {
       gateway.node.addDependency(role);
       addWebSearchTarget(gateway, "ApiKey");
 
-      const rules: wafv2.CfnWebACL.RuleProperty[] = [];
-      const visibility = (metricName: string) => ({ cloudWatchMetricsEnabled: true, metricName, sampledRequestsEnabled: true });
-
-      if (allowedCidrs.length > 0) {
-        // 許可リストに含まれない送信元をすべてブロックする。IP セットは IPv4 と IPv6 で別リソースになる
-        const ipSetRefs = (["IPV4", "IPV6"] as const)
-          .map((version) => ({ version, addresses: version === "IPV4" ? allowed.ipv4 : allowed.ipv6 }))
-          .filter((x) => x.addresses.length > 0)
-          .map(({ version, addresses }) => ({
-            ipSetReferenceStatement: {
-              arn: new wafv2.CfnIPSet(this, `ApiKeyGatewayAllowed${version}`, {
-                scope: "REGIONAL",
-                ipAddressVersion: version,
-                addresses,
-              }).attrArn,
-            },
-          }));
-        rules.push({
-          name: "BlockNotAllowedIps",
-          priority: 0,
-          action: { block: {} },
-          statement: {
-            notStatement: {
-              statement: ipSetRefs.length === 1 ? ipSetRefs[0] : { orStatement: { statements: ipSetRefs } },
-            },
-          },
-          visibilityConfig: visibility("BlockNotAllowedIps"),
-        });
-      }
-      if (props.enableWaf ?? true) {
-        rules.push({
-          name: "RateLimitPerIp",
-          priority: 1,
-          action: { block: {} },
-          statement: {
-            rateBasedStatement: {
-              aggregateKeyType: "IP",
-              evaluationWindowSec: 300,
-              limit: props.wafRequestsPer5MinPerIp ?? 300,
-            },
-          },
-          visibilityConfig: visibility("RateLimitPerIp"),
-        });
-      }
-
-      // IP 制限には WAF が必要なので、enableWaf=false でも allowedIps があれば Web ACL を作る
-      if (rules.length > 0) {
-        const webAcl = new wafv2.CfnWebACL(this, "ApiKeyGatewayWebAcl", {
-          scope: "REGIONAL",
-          defaultAction: { allow: {} },
-          visibilityConfig: visibility(`${this.stackName}-apikey-gateway`),
-          rules,
-        });
-        new wafv2.CfnWebACLAssociation(this, "ApiKeyGatewayWebAclAssociation", {
-          resourceArn: gateway.attrGatewayArn,
-          webAclArn: webAcl.attrArn,
-        });
-      }
+      attachWaf(gateway, "ApiKey", { rateLimit: props.enableWaf ?? true });
 
       new cdk.CfnOutput(this, "ApiKeyGatewayUrl", { value: gateway.attrGatewayUrl });
       new cdk.CfnOutput(this, "ApiKeySecretArn", { value: secret.secretArn });
@@ -241,25 +272,7 @@ export class WebSearchGatewayStack extends cdk.Stack {
       gateway.node.addDependency(role);
       addWebSearchTarget(gateway, "Iam");
 
-      if (allowedCidrs.length > 0) {
-        // 明示的な Deny は呼び出し元の IAM 権限（管理者を含む）より優先されるため、許可リスト外からは誰も呼び出せない
-        new agentcore.CfnResourcePolicy(this, "IamGatewayResourcePolicy", {
-          resourceArn: gateway.attrGatewayArn,
-          policy: cdk.Stack.of(this).toJsonString({
-            Version: "2012-10-17",
-            Statement: [
-              {
-                Sid: "DenyNotAllowedIps",
-                Effect: "Deny",
-                Principal: "*",
-                Action: "bedrock-agentcore:InvokeGateway",
-                Resource: gateway.attrGatewayArn,
-                Condition: { NotIpAddress: { "aws:SourceIp": allowedCidrs } },
-              },
-            ],
-          }),
-        });
-      }
+      restrictBySourceIp(gateway, "Iam");
 
       // 呼び出し側に付与するためのポリシー（ユーザーやロールにアタッチして使う）
       const invokePolicy = new iam.ManagedPolicy(this, "IamGatewayInvokePolicy", {
@@ -274,6 +287,60 @@ export class WebSearchGatewayStack extends cdk.Stack {
 
       new cdk.CfnOutput(this, "IamGatewayUrl", { value: gateway.attrGatewayUrl });
       new cdk.CfnOutput(this, "IamGatewayInvokePolicyArn", { value: invokePolicy.managedPolicyArn });
+    }
+
+    if (props.authModes.includes("cognito")) {
+      const userPool = new cognito.UserPool(this, "UserPool", {
+        // 利用者は管理者が招待する。セルフサインアップを開けると誰でも検索できてしまう
+        selfSignUpEnabled: false,
+        signInAliases: { email: true },
+        mfa: cognito.Mfa.OPTIONAL,
+        mfaSecondFactor: { otp: true, sms: false },
+        accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+      const domain = userPool.addDomain("Domain", {
+        cognitoDomain: { domainPrefix: `${this.stackName.toLowerCase()}-${this.account}` },
+      });
+      // パブリッククライアント（シークレットなし）+ 認可コードフロー + PKCE。MCP クライアントの手元に長期のシークレットを置かない
+      const client = userPool.addClient("McpClient", {
+        generateSecret: false,
+        authFlows: {},
+        oAuth: {
+          flows: { authorizationCodeGrant: true },
+          scopes: [cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL, cognito.OAuthScope.PROFILE],
+          callbackUrls: props.oauthCallbackUrls?.length ? props.oauthCallbackUrls : ["http://localhost:53280/callback"],
+        },
+        accessTokenValidity: cdk.Duration.minutes(props.accessTokenValidityMinutes ?? 60),
+        idTokenValidity: cdk.Duration.minutes(props.accessTokenValidityMinutes ?? 60),
+        refreshTokenValidity: cdk.Duration.days(props.refreshTokenValidityDays ?? 7),
+        preventUserExistenceErrors: true,
+        enableTokenRevocation: true,
+      });
+
+      const gateway = new agentcore.CfnGateway(this, "CognitoGateway", {
+        name: `${this.stackName}-cognito`.toLowerCase(),
+        description: "Web Search MCP gateway (Cognito OAuth / short-lived JWT)",
+        protocolType: "MCP",
+        authorizerType: "CUSTOM_JWT",
+        authorizerConfiguration: {
+          customJwtAuthorizer: {
+            discoveryUrl: `https://cognito-idp.${this.region}.amazonaws.com/${userPool.userPoolId}/.well-known/openid-configuration`,
+            allowedClients: [client.userPoolClientId],
+          },
+        },
+        roleArn: role.roleArn,
+      });
+      gateway.node.addDependency(role);
+      addWebSearchTarget(gateway, "Cognito");
+      // JWT 認証のリクエストではリソースポリシーの aws:SourceIp が評価に使えず全拒否になる（実環境で確認）ため、IP 制限は WAF で行う。
+      // 未認証のリクエストは Gateway の JWT 検証で弾かれるので、レート制限用の WAF は付けない
+      attachWaf(gateway, "Cognito", { rateLimit: false });
+
+      new cdk.CfnOutput(this, "CognitoGatewayUrl", { value: gateway.attrGatewayUrl });
+      new cdk.CfnOutput(this, "CognitoUserPoolId", { value: userPool.userPoolId });
+      new cdk.CfnOutput(this, "CognitoClientId", { value: client.userPoolClientId });
+      new cdk.CfnOutput(this, "CognitoDomain", { value: domain.baseUrl() });
     }
 
     new cdk.CfnOutput(this, "Region", { value: this.region });

@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { getApiKey, loadOutputs, sigv4Fetch } from "./lib";
+import { getApiKey, getCognitoAccessToken, loadOutputs, sigv4Fetch } from "./lib";
 
 const TOOL = "web-search___WebSearch";
 const QUERY = process.argv[2] ?? "Amazon Bedrock AgentCore Web Search Tool";
@@ -60,6 +60,19 @@ async function main() {
   if (outputs.IamGatewayUrl) {
     await expectRejected("iam / unsigned", outputs.IamGatewayUrl, {});
     await exercise("iam / SigV4", await connect(outputs.IamGatewayUrl, { fetch: sigv4Fetch(outputs.Region) }));
+    ran++;
+  }
+
+  if (outputs.CognitoGatewayUrl) {
+    await expectRejected("cognito / no token", outputs.CognitoGatewayUrl, {});
+    await expectRejected("cognito / invalid token", outputs.CognitoGatewayUrl, { Authorization: "Bearer invalid.jwt.token" });
+    const { COGNITO_TEST_USERNAME: user, COGNITO_TEST_PASSWORD: pass } = process.env;
+    if (user && pass) {
+      const token = await getCognitoAccessToken(outputs, user, pass);
+      await exercise("cognito / OAuth token", await connect(outputs.CognitoGatewayUrl, { headers: { Authorization: `Bearer ${token}` } }));
+    } else {
+      console.log("⏭  cognito / OAuth token: skipped (set COGNITO_TEST_USERNAME and COGNITO_TEST_PASSWORD to run)");
+    }
     ran++;
   }
 

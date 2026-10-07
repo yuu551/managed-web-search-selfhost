@@ -4,7 +4,8 @@ Amazon Bedrock AgentCore Gateway のマネージド Web Search Tool を CDK で�
 
 - 検索インデックスは Amazon 側で運用されており、検索クエリは AWS の外に出ません
 - 外部の検索 API を契約したり、サーバーを独自に管理したりする負担がありません
-- 認証方式は IAM 方式と API Key 方式の2通りに対応しています。標準では IAM 方式を作成し、API Key 方式も用意する場合は `-c authModes=apikey,iam` を指定します
+- 認証方式は IAM 方式・Cognito 方式・API Key 方式の3通りに対応しています。標準では IAM 方式を作成し、ほかの方式は `-c authModes=iam,cognito` のように指定して追加します
+  - Cognito 方式: ブラウザでログインし、有効期限 1 時間のトークンで接続します。AWS アカウントを持たない人にも配れます
   - API Key 方式: URL とヘッダーを設定すれば、幅広いクライアントからそのまま接続できます。ただし推奨しません（理由は [API Key 方式](#api-key-方式) を参照）
   - IAM 方式: `awsume` などの AWS 認証情報をそのまま使うため、シークレットの管理が不要です
 
@@ -35,7 +36,7 @@ Amazon Bedrock AgentCore Gateway のマネージド Web Search Tool を CDK で�
 pnpm install
 pnpm test          # ユニットテストと CDK テンプレートのテスト
 pnpm run deploy    # cdk-outputs.json に URL などが出力される
-pnpm smoke         # 実環境の E2E テスト（両方式で接続・検索・不正キーの拒否を確認）
+pnpm smoke         # 実環境の E2E テスト（各方式で接続・検索・不正な認証情報の拒否を確認）
 ```
 
 デプロイ先のリージョンは `AWS_REGION` や `CDK_DEFAULT_REGION` を参照します。東京リージョンへデプロイする場合は次のように環境変数を指定します。
@@ -44,16 +45,25 @@ pnpm smoke         # 実環境の E2E テスト（両方式で接続・検索・
 AWS_REGION=ap-northeast-1 pnpm run deploy
 ```
 
+Cognito 方式のログインまで E2E テストする場合は、テスト用ユーザーの認証情報を渡します。
+
+```bash
+COGNITO_TEST_USERNAME=user@example.com COGNITO_TEST_PASSWORD='...' pnpm smoke
+```
+
 ### デプロイオプション（`-c key=value` で指定）
 
 | キー | 既定値 | 説明 |
 | --- | --- | --- |
-| `authModes` | `iam` | 作成する Gateway。`apikey` で API Key 方式、`apikey,iam` で両方を作る |
+| `authModes` | `iam` | 作成する Gateway。`iam` / `cognito` / `apikey` をカンマ区切りで指定する |
 | `excludeDomains` | なし | 検索結果から常に除外するドメイン（カンマ区切り） |
 | `enableWaf` | `true` | API Key 方式の Gateway に WAF を付けるか |
 | `wafRequestsPer5MinPerIp` | `300` | WAF で許可する 1 IP あたりのリクエスト数（5 分間） |
 | `searchesPerMinute` | `60` | Gateway ごとの WebSearch 呼び出し上限（全クライアントの合計、1 分あたり） |
-| `allowedIps` | なし | 接続を許可する送信元 IP（IPv4 / IPv6 の CIDR をカンマ区切りで混在可）。IAM 方式は Gateway のリソースポリシー、API Key 方式は WAF の IP セットで制限する |
+| `allowedIps` | なし | 接続を許可する送信元 IP（IPv4 / IPv6 の CIDR をカンマ区切りで混在可）。IAM 方式は Gateway のリソースポリシー、Cognito 方式と API Key 方式は WAF の IP セットで制限する |
+| `oauthCallbackUrls` | `http://localhost:53280/callback` | Cognito 方式で MCP クライアントが待ち受けるコールバック URL（カンマ区切り） |
+| `accessTokenValidityMinutes` | `60` | Cognito 方式のアクセストークンの有効期限（分、5〜1440） |
+| `refreshTokenValidityDays` | `7` | Cognito 方式のリフレッシュトークンの有効期限（日）。切れると再ログインが必要になる |
 | `stackName` | `ManagedWebSearch` | スタック名（Gateway 名のプレフィックスにもなる） |
 
 ```bash
@@ -118,6 +128,39 @@ Claude Desktop などの stdio 接続を使うクライアントでは、`mcp-re
 claude mcp add websearch -- uvx mcp-proxy-for-aws@latest <IamGatewayUrl> --service bedrock-agentcore --region us-east-1
 ```
 
+### Cognito 方式
+
+利用者は Cognito のユーザーとして招待します。セルフサインアップは無効にしています。
+
+```bash
+aws cognito-idp admin-create-user --user-pool-id <CognitoUserPoolId> \
+  --username user@example.com \
+  --user-attributes Name=email,Value=user@example.com Name=email_verified,Value=true
+```
+
+Claude Code には、クライアント ID とコールバックポートを指定して登録します。
+
+```bash
+claude mcp add --transport http websearch <CognitoGatewayUrl> --client-id <CognitoClientId> --callback-port 53280
+claude mcp login websearch   # Claude Code の中で /mcp から認証しても同じ
+```
+
+ログインの流れは次のとおりです。
+
+1. Claude Code が Gateway に接続すると 401 が返り、Gateway の OAuth メタデータ（`/.well-known/oauth-protected-resource`）から Cognito が認可サーバーだと分かります。利用者が設定するのはクライアント ID だけです
+2. ブラウザで Cognito のログイン画面が開きます。招待メールの仮パスワードで初回ログインすると、新しいパスワードの設定を求められます
+3. ログインすると `http://localhost:53280/callback` にリダイレクトされ、Claude Code がトークンを受け取ります。ブラウザはそのまま閉じて構いません
+4. アクセストークンは 1 時間で切れ、リフレッシュトークン（7 日）で自動更新されます。リフレッシュトークンが切れたら、もう一度ログインします
+
+利用を止めるときは、ユーザーを無効化してサインアウトさせます。発行済みのアクセストークンは期限（最大 1 時間）まで使えます。
+
+```bash
+aws cognito-idp admin-disable-user --user-pool-id <CognitoUserPoolId> --username user@example.com
+aws cognito-idp admin-user-global-sign-out --user-pool-id <CognitoUserPoolId> --username user@example.com
+```
+
+Cognito は動的クライアント登録に対応していないため、クライアント ID を事前に設定できない MCP クライアントからは使えません。
+
 ## ツール
 
 | ツール名 | 引数 |
@@ -130,7 +173,9 @@ claude mcp add websearch -- uvx mcp-proxy-for-aws@latest <IamGatewayUrl> --servi
 
 ### IP 制限
 
-`allowedIps` を指定すると、許可リスト外の送信元からの呼び出しを拒否します。IAM 方式では Gateway のリソースポリシーに明示的な Deny を付けるので、管理者権限を持つ呼び出し元も拒否され、追加料金はかかりません。API Key 方式では WAF の IP セットで遮断します。
+`allowedIps` を指定すると、許可リスト外の送信元からの呼び出しを拒否します。IAM 方式では Gateway のリソースポリシーに明示的な Deny を付けるので、管理者権限を持つ呼び出し元も拒否され、追加料金はかかりません。Cognito 方式と API Key 方式では WAF の IP セットで遮断します。WAF の固定費は月 $6 程度です。
+
+- Cognito 方式（JWT 認証）でリソースポリシーの `aws:SourceIp` 条件を使うと、許可リスト内の送信元も含めてすべて拒否されました。JWT 認証のリクエストでは送信元 IP がポリシー評価に使われないためです。そのため Cognito 方式は WAF で制限しています
 
 - 許可する IP は、AWS から見える送信元 IP で指定してください。VPN や Cloudflare WARP などを経由すると、`curl https://checkip.amazonaws.com` の結果が接続のたびに変わることがあります。CloudTrail の `sourceIPAddress` でも確認できます
 - 2026 年 10 月時点では Gateway のエンドポイントに AAAA レコードがなく、IPv4 でしか接続できません。IPv6 の CIDR も指定できるので、エンドポイントがデュアルスタックに対応すればそのまま有効になります

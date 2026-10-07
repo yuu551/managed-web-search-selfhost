@@ -152,6 +152,40 @@ describe("WebSearchGatewayStack", () => {
     });
   });
 
+  it("creates a Cognito JWT gateway with an invite-only user pool and a public PKCE client", () => {
+    const t = synth({ authModes: ["cognito"] });
+    t.hasResourceProperties("AWS::Cognito::UserPool", { AdminCreateUserConfig: { AllowAdminCreateUserOnly: true } });
+    t.hasResourceProperties("AWS::Cognito::UserPoolClient", {
+      GenerateSecret: false,
+      AllowedOAuthFlows: ["code"],
+      AllowedOAuthScopes: ["openid", "email", "profile"],
+      CallbackURLs: ["http://localhost:53280/callback"],
+      AccessTokenValidity: 60,
+      RefreshTokenValidity: 10080,
+      TokenValidityUnits: Match.objectLike({ AccessToken: "minutes", RefreshToken: "minutes" }),
+    });
+    t.hasResourceProperties("AWS::BedrockAgentCore::Gateway", {
+      Name: "teststack-cognito",
+      AuthorizerType: "CUSTOM_JWT",
+      AuthorizerConfiguration: {
+        CustomJWTAuthorizer: {
+          DiscoveryUrl: Match.anyValue(),
+          AllowedClients: [{ Ref: Match.stringLikeRegexp("UserPoolMcpClient") }],
+        },
+      },
+    });
+    t.resourceCountIs("AWS::WAFv2::WebACL", 0);
+  });
+
+  it("restricts the Cognito gateway by IP with WAF (not a resource policy, which breaks JWT callers)", () => {
+    const t = synth({ authModes: ["cognito"], allowedIps: ["203.0.113.0/24", "2001:db8::/32"] });
+    t.resourceCountIs("AWS::BedrockAgentCore::ResourcePolicy", 0);
+    t.resourceCountIs("AWS::WAFv2::IPSet", 2);
+    t.hasResourceProperties("AWS::WAFv2::WebACL", {
+      Rules: [Match.objectLike({ Name: "BlockNotAllowedIps" })],
+    });
+  });
+
   it("rejects unsupported regions", () => {
     expect(() => synth({}, "us-west-2")).toThrow(/not available in us-west-2/);
   });

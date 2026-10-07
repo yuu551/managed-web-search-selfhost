@@ -55,6 +55,21 @@ Amazon Bedrock AgentCore Gateway の Web Search Tool（マネージドConnector�
 - クライアントからは `uvx mcp-proxy-for-aws@latest <url> --service bedrock-agentcore --region <region>` を stdio MCP サーバーとして登録する
 - シークレット管理が不要で、awsume 等で得た一時クレデンシャルをそのまま使える
 
+### 方式3: Cognito（オプション、AWS アカウントを持たない利用者向け）
+
+- `authorizerType: CUSTOM_JWT`。Cognito ユーザープールの OIDC discovery URL と、アプリクライアント ID（`allowedClients`）で検証する
+- アプリクライアントはシークレットなしのパブリッククライアントで、認可コードフローと PKCE を使う。コールバックは `http://localhost:53280/callback`
+- アクセストークンは既定で 1 時間、リフレッシュトークンは 7 日。クライアントの手元に長期のシークレットが残らない
+- セルフサインアップは無効にして、管理者が招待する
+- Gateway は 401 応答の `WWW-Authenticate` で `resource_metadata` を返し、`/.well-known/oauth-protected-resource` で Cognito を認可サーバーとして公開する。MCP クライアントは Cognito の OIDC メタデータからエンドポイントを見つける
+- Cognito は動的クライアント登録に対応していないため、クライアント ID を事前に設定する（Claude Code は `--client-id` / `--callback-port`）
+- 未認証のリクエストは Gateway の JWT 検証で弾かれ、Lambda は動かない。そのためレート制限用の WAF は付けない
+- 実環境で確認したこと
+  - Claude Code の `claude mcp login` でログインし、検索できた
+  - Claude Code は PKCE（S256）と `resource` パラメータを付けて認可リクエストを送るが、Cognito は問題なく受け付けた。Cognito の OIDC メタデータには `code_challenge_methods_supported` がないが、Claude Code は拒否しなかった
+  - JWT 認証のリクエストでは、リソースポリシーの `aws:SourceIp` 条件が使えない。`NotIpAddress` の Deny を付けると、許可リスト内の送信元も拒否された。IP 制限は WAF の IP セットで行う
+- 未検証: 1 時間後のトークン自動更新、招待メールの仮パスワードから始まる初回ログイン、Claude Code 以外のクライアント
+
 ## CDK 構成
 
 | ファイル | 役割 |

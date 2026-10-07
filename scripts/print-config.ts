@@ -76,6 +76,20 @@ async function main() {
     console.log("## mcp.json 形式（stdio）  ※プロファイルを固定するなら --profile <name> を追加");
     console.log(JSON.stringify({ mcpServers: { [NAME]: { command: "uvx", args: proxyArgs } } }, null, 2), "\n");
   }
+
+  if (outputs.CognitoGatewayUrl) {
+    const url = outputs.CognitoGatewayUrl;
+    console.log(`# Cognito 方式  (${url})\n`);
+    console.log("利用者を招待する（仮パスワードがメールで届き、初回ログイン時に変更を求められる）:");
+    console.log(
+      `  aws cognito-idp admin-create-user --region ${outputs.Region} --user-pool-id ${outputs.CognitoUserPoolId} --username <email> --user-attributes Name=email,Value=<email> Name=email_verified,Value=true\n`,
+    );
+    console.log("## Claude Code（追加後に /mcp か `claude mcp login websearch` でブラウザログイン）");
+    console.log(`claude mcp add --transport http ${NAME} ${url} --client-id ${outputs.CognitoClientId} --callback-port 53280\n`);
+    console.log("## その他の OAuth 対応クライアント");
+    console.log(`  Client ID: ${outputs.CognitoClientId}（シークレットなし）`);
+    console.log("  Redirect URI: http://localhost:53280/callback（oauthCallbackUrls で変更可）\n");
+  }
 }
 
 main().catch((e) => {
