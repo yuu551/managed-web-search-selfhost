@@ -1,12 +1,12 @@
 # managed-web-search-selfhost
 
-Amazon Bedrock AgentCore Gateway のマネージド Web Search Tool を自分の AWS アカウントに CDK でデプロイし、MCP サーバーとして使えるようにするプロジェクトです。Web 検索を持たない MCP クライアント（Bedrock 経由の Claude Code、ローカル LLM のクライアント、自作エージェントなど）に Web 検索を追加できます。
+Amazon Bedrock AgentCore Gateway のマネージド Web Search Tool を CDK で自身の AWS アカウントへデプロイし、MCP サーバーとして利用するためのプロジェクトです。Bedrock 経由の Claude Code やローカル LLM、自作エージェントなど、Web 検索機能を持たない MCP クライアントに検索機能を提供します。
 
-- 検索インデックスは Amazon が運用していて、検索クエリは AWS の外に出ません
-- 検索 API キーの契約もサーバーの運用も不要です
-- 認証方式は2つ用意しています。既定では IAM 方式だけを作り、API Key 方式は `-c authModes=apikey,iam` を付けたときに作ります
-  - **API Key 方式**: URL とヘッダーを設定するだけで、ほとんどのクライアントから使えます
-  - **IAM 方式**: AWS の認証情報（awsume など）をそのまま使います。シークレットの管理が不要です
+- 検索インデックスは Amazon 側で運用されており、検索クエリは AWS の外に出ません
+- 外部の検索 API を契約したり、サーバーを独自に管理したりする負担がありません
+- 認証方式は IAM 方式と API Key 方式の2通りに対応しています。標準では IAM 方式を作成し、API Key 方式も用意する場合は `-c authModes=apikey,iam` を指定します
+  - API Key 方式: URL とヘッダーを設定すれば、幅広いクライアントからそのまま接続できます
+  - IAM 方式: `awsume` などの AWS 認証情報をそのまま使うため、シークレットの管理が不要です
 
 設計の詳細は [docs/design.md](docs/design.md) にまとめています。
 
@@ -21,7 +21,7 @@ MCP クライアント ──SigV4──▶ Gateway (AWS_IAM) ──────
 
 - Node.js 22 以上と pnpm
 - AWS 認証情報（`awsume` などで設定済みのもの）
-- 対応リージョン: `us-east-1` / `eu-west-1` / `ap-northeast-1`
+- 対応リージョン（`us-east-1` / `eu-west-1` / `ap-northeast-1`）
 - 対象のアカウントとリージョンで `cdk bootstrap` を実行済みであること
 - IAM 方式を使う場合は `uv`（`uvx`）
 
@@ -34,13 +34,13 @@ pnpm run deploy    # cdk-outputs.json に URL などが出力される
 pnpm smoke         # 実環境の E2E テスト（両方式で接続・検索・不正キーの拒否を確認）
 ```
 
-リージョンは `AWS_REGION` / `CDK_DEFAULT_REGION` で決まります。東京リージョンにデプロイする例は次のとおりです。
+デプロイ先のリージョンは `AWS_REGION` や `CDK_DEFAULT_REGION` を参照します。東京リージョンへデプロイする場合は次のように環境変数を指定します。
 
 ```bash
 AWS_REGION=ap-northeast-1 pnpm run deploy
 ```
 
-### オプション（`-c key=value` で指定）
+### デプロイオプション（`-c key=value` で指定）
 
 | キー | 既定値 | 説明 |
 | --- | --- | --- |
@@ -58,7 +58,7 @@ pnpm run deploy -c excludeDomains=example.com,example.net -c searchesPerMinute=3
 
 ## クライアントからの接続
 
-次のコマンドで、各クライアント向けの設定がそのまま出力されます。
+次のコマンドを実行すると、各クライアント向けの設定が出力されます。
 
 ```bash
 pnpm mcp-config             # API Key はプレースホルダーで表示
@@ -67,7 +67,7 @@ pnpm mcp-config --with-key  # API Key を埋め込んで表示
 
 ### API Key 方式
 
-Streamable HTTP に対応したクライアントでは、URL とヘッダーを設定します。ヘッダーは `Authorization: Bearer <key>` と `x-api-key: <key>` のどちらでも構いません。
+Streamable HTTP に対応したクライアントでは、URL とヘッダーを指定します。ヘッダーには `Authorization: Bearer <key>` または `x-api-key: <key>` を設定します。
 
 ```bash
 # Claude Code
@@ -86,7 +86,7 @@ claude mcp add --transport http websearch <ApiKeyGatewayUrl> --header "Authoriza
 }
 ```
 
-stdio しか使えないクライアント（Claude Desktop など）では、`mcp-remote` で中継します。
+Claude Desktop などの stdio 接続を使うクライアントでは、`mcp-remote` で中継します。
 
 ```json
 {
@@ -102,7 +102,7 @@ stdio しか使えないクライアント（Claude Desktop など）では、`m
 
 ### IAM 方式
 
-呼び出し元に `bedrock-agentcore:InvokeGateway` が必要です。スタック出力の `IamGatewayInvokePolicyArn` をアタッチしてください。管理者権限があれば追加の設定はいりません。
+呼び出し元には `bedrock-agentcore:InvokeGateway` 権限が必要です。スタック出力に含まれる `IamGatewayInvokePolicyArn` をアタッチしてください。管理者権限がある環境なら追加の設定は不要です。
 
 ```bash
 # Claude Code
@@ -115,13 +115,13 @@ claude mcp add websearch -- uvx mcp-proxy-for-aws@latest <IamGatewayUrl> --servi
 | --- | --- |
 | `web-search___WebSearch` | `query`（必須、200 文字以内）、`maxResults`（1〜25、既定 10）、`filters.domainFilter.include/exclude`、`filters.publishedDateFilter.from/to` |
 
-結果には本文の抜粋、URL、タイトル、公開日が含まれます。利用規約上、検索結果をユーザーに表示するときは出典 URL を残す必要があります。
+検索結果には本文の抜粋、URL、タイトル、公開日が含まれます。利用規約上、結果をユーザーへ表示する際は出典 URL を残す必要があります。
 
 ## 運用
 
 ### API Key の追加・ローテーション
 
-シークレットにはカンマ区切りで複数のキーを登録できます。クライアントごとにキーを分けて発行すれば、1つだけ無効にすることもできます。Interceptor はシークレットを 5 分間キャッシュするので、変更が反映されるまで最大 5 分かかります。
+シークレットにはカンマ区切りで複数のキーを登録できます。クライアントごとに個別のキーを発行しておけば、特定のキーを個別に失効させられます。Interceptor がシークレットを 5 分間キャッシュするため、設定変更の反映には最大 5 分かかります。
 
 ```bash
 SECRET_ARN=$(jq -r .ManagedWebSearch.ApiKeySecretArn cdk-outputs.json)
@@ -132,12 +132,12 @@ aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --secret-string "$
 
 ### コストと攻撃への備え
 
-- Gateway に固定費はかかりません。課金は API 呼び出し（$0.005/1,000 件）と Web Search のクエリ数に応じて発生します
-- API Key 方式の Gateway（`NONE` 認証）では、キーの誤ったリクエストもGatewayに届いた時点で課金されます。拒否されたリクエストは Gateway と Lambda の料金だけで、Web Search の料金はかかりません。目安は 100 万リクエストあたり約 $5 です
-- そのため既定で次の2つを有効にしています
-  - **WAF の IP 単位レート制限**: Gateway より手前で遮断します。固定費は月 $6 程度で、加えて $0.60/100 万リクエストかかります
-  - **Gateway のレート制限**（追加料金なし）: WebSearch の呼び出し回数に上限をかけます。キーが漏れても検索料金が青天井になりません
-- AWS Budgets で予算アラートを設定しておくと安心です
+- Gateway 自体に固定費はなく、API 呼び出し（1,000 件あたり $0.005）と Web Search のクエリ数に応じて課金されます。
+- API Key 方式（`NONE` 認証）の Gateway では、誤ったキーのリクエストも Gateway に届いた時点で課金対象になります。認証で拒否されたリクエストでは Web Search は実行されないため検索料金は発生せず、Gateway と Lambda の呼び出し料金（100 万リクエストあたり約 $5）が発生します。
+- 意図しない課金の急増を防ぐため、次の 2 つのレート制限を用意しています。
+  - WAF による IP 単位のレート制限（API Key 方式の Gateway で既定で有効）。Gateway の手前でリクエストを遮断します。費用は月額約 $6 の固定費と、100 万リクエストあたり $0.60 の従量料金です。
+  - Gateway 本体のレート制限（両方式で有効、追加料金なし）。Web Search の呼び出し回数に上限を設け、キーが漏洩した場合でも検索費用の膨張を防ぎます。
+- 想定外の支出を早期に検知できるよう、AWS Budgets で予算アラートを設定しておくことを推奨します。
 
 ### 削除
 
