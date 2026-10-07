@@ -25,4 +25,5 @@ new WebSearchGatewayStack(app, app.node.tryGetContext("stackName") ?? "ManagedWe
   enableWaf: String(app.node.tryGetContext("enableWaf") ?? "true") !== "false",
   wafRequestsPer5MinPerIp: num(app.node.tryGetContext("wafRequestsPer5MinPerIp")),
   searchesPerMinute: num(app.node.tryGetContext("searchesPerMinute")),
+  allowedIps: csv(app.node.tryGetContext("allowedIps")),
 });

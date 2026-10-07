@@ -53,11 +53,13 @@ AWS_REGION=ap-northeast-1 pnpm run deploy
 | `enableWaf` | `true` | API Key 方式の Gateway に WAF を付けるか |
 | `wafRequestsPer5MinPerIp` | `300` | WAF で許可する 1 IP あたりのリクエスト数（5 分間） |
 | `searchesPerMinute` | `60` | Gateway ごとの WebSearch 呼び出し上限（全クライアントの合計、1 分あたり） |
+| `allowedIps` | なし | 接続を許可する送信元 IP（IPv4 / IPv6 の CIDR をカンマ区切りで混在可）。IAM 方式は Gateway のリソースポリシー、API Key 方式は WAF の IP セットで制限する |
 | `stackName` | `ManagedWebSearch` | スタック名（Gateway 名のプレフィックスにもなる） |
 
 ```bash
 pnpm run deploy -c authModes=apikey,iam   # API Key 方式も作る（WAF の固定費が月 $6 程度かかる）
 pnpm run deploy -c excludeDomains=example.com,example.net -c searchesPerMinute=30
+pnpm run deploy -c allowedIps=203.0.113.0/24,2001:db8::/32
 ```
 
 ## クライアントからの接続
@@ -125,6 +127,13 @@ claude mcp add websearch -- uvx mcp-proxy-for-aws@latest <IamGatewayUrl> --servi
 検索結果には本文の抜粋、URL、タイトル、公開日が含まれます。利用規約上、結果をユーザーへ表示する際は出典 URL を残す必要があります。
 
 ## 運用
+
+### IP 制限
+
+`allowedIps` を指定すると、許可リスト外の送信元からの呼び出しを拒否します。IAM 方式では Gateway のリソースポリシーに明示的な Deny を付けるので、管理者権限を持つ呼び出し元も拒否され、追加料金はかかりません。API Key 方式では WAF の IP セットで遮断します。
+
+- 許可する IP は、AWS から見える送信元 IP で指定してください。VPN や Cloudflare WARP などを経由すると、`curl https://checkip.amazonaws.com` の結果が接続のたびに変わることがあります。CloudTrail の `sourceIPAddress` でも確認できます
+- 2026 年 10 月時点では Gateway のエンドポイントに AAAA レコードがなく、IPv4 でしか接続できません。IPv6 の CIDR も指定できるので、エンドポイントがデュアルスタックに対応すればそのまま有効になります
 
 ### API Key の追加・ローテーション
 

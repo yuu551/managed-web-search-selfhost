@@ -75,6 +75,7 @@ Amazon Bedrock AgentCore Gateway の Web Search Tool（マネージドConnector�
 | `enableWaf` | `true` | API Key 方式の Gateway に WAF を付けるか |
 | `wafRequestsPer5MinPerIp` | `300` | WAF で許可する 1 IP あたりのリクエスト数（5分間） |
 | `searchesPerMinute` | `60` | Gateway ごとの WebSearch 呼び出し上限（全クライアント合計） |
+| `allowedIps` | なし | 許可する送信元 IP（IPv4 / IPv6 の CIDR）。IAM 方式はリソースポリシーの Deny（`NotIpAddress aws:SourceIp`）、API Key 方式は WAF の IP セット（IPv4 / IPv6 で別リソース）で制限する |
 | `stackName` | `ManagedWebSearch` | スタック名 |
 
 リージョンは `CDK_DEFAULT_REGION`（awsume のリージョン）を使い、未対応リージョンなら synth 時にエラーにする。
@@ -86,6 +87,13 @@ Amazon Bedrock AgentCore Gateway の Web Search Tool（マネージドConnector�
 - API Key 方式の Gateway URL は公開エンドポイントになる。キーが漏れたら Secrets Manager の値を更新すれば、最大5分で無効化される
 - 利用規約上、検索結果を表示するときは出典URLを残す必要がある
 - Connector の既定のツール説明は空なので、`Description` を設定し、LLM がいつ使うべきか判断できるようにする
+
+### IP 制限
+
+- IAM 方式: `AWS::BedrockAgentCore::ResourcePolicy` で `Principal: "*"` に Deny を付け、条件を `NotIpAddress aws:SourceIp` にする。明示的な Deny は identity ベースの許可より優先されるので、管理者も許可リスト外からは呼び出せない。追加料金なし
+- API Key 方式: `NONE` 認証では IAM の評価に頼れないため、WAF の IP セットを使う。`enableWaf=false` でも `allowedIps` があれば Web ACL を作る
+- 実環境で確認したこと（IAM 方式）: 許可リスト外の送信元からは SigV4 署名付きでも `-32002 Insufficient permissions` で拒否され、許可リスト内なら通った
+- Gateway のエンドポイントは IPv4 のみ（AAAA レコードなし）。IPv6 の CIDR は将来のデュアルスタック対応に備えて受け付ける
 
 ### 攻撃とコストへの対策
 

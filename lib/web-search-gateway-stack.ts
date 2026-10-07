@@ -1,3 +1,4 @@
+import { isIPv4, isIPv6 } from "node:net";
 import * as path from "node:path";
 import * as cdk from "aws-cdk-lib";
 import * as agentcore from "aws-cdk-lib/aws-bedrockagentcore";
@@ -17,6 +18,21 @@ const TOOL_DESCRIPTION =
   "Search the web for up-to-date information such as recent news, releases, documentation, and facts after your training cutoff. " +
   "Returns relevant text snippets with URL, title, and published date. Always cite the source URLs in your answer.";
 
+/** CIDR（プレフィックス省略時は単一アドレス）を IPv4 / IPv6 に振り分け、/32・/128 を補う */
+export function classifyCidrs(cidrs: string[]): { ipv4: string[]; ipv6: string[] } {
+  const ipv4: string[] = [];
+  const ipv6: string[] = [];
+  for (const raw of cidrs) {
+    const [addr, prefix, ...rest] = raw.trim().split("/");
+    const bits = prefix === undefined ? undefined : Number(prefix);
+    const validPrefix = (max: number) => bits === undefined || (Number.isInteger(bits) && bits >= 0 && bits <= max);
+    if (rest.length === 0 && isIPv4(addr) && validPrefix(32)) ipv4.push(`${addr}/${bits ?? 32}`);
+    else if (rest.length === 0 && isIPv6(addr) && validPrefix(128)) ipv6.push(`${addr}/${bits ?? 128}`);
+    else throw new Error(`Invalid CIDR in allowedIps: ${raw}`);
+  }
+  return { ipv4, ipv6 };
+}
+
 export interface WebSearchGatewayStackProps extends cdk.StackProps {
   authModes: AuthMode[];
   /** 検索結果から常に除外するドメイン（Target レベルで強制され、クライアントからは見えない） */
@@ -31,6 +47,11 @@ export interface WebSearchGatewayStackProps extends cdk.StackProps {
   wafRequestsPer5MinPerIp?: number;
   /** Gateway ごとの WebSearch 呼び出し上限（1 分あたり、全クライアント合計） @default 60 */
   searchesPerMinute?: number;
+  /**
+   * 接続を許可する送信元 IP（IPv4 / IPv6 の CIDR を混在可）。未指定なら制限しない。
+   * IAM 方式は Gateway のリソースポリシー、API Key 方式は WAF の IP セットで制限する
+   */
+  allowedIps?: string[];
 }
 
 export class WebSearchGatewayStack extends cdk.Stack {
@@ -59,6 +80,9 @@ export class WebSearchGatewayStack extends cdk.Stack {
         resources: [`arn:${this.partition}:bedrock-agentcore:${this.region}:aws:tool/web-search.v1`],
       }),
     );
+
+    const allowed = classifyCidrs(props.allowedIps ?? []);
+    const allowedCidrs = [...allowed.ipv4, ...allowed.ipv6];
 
     const parameterValues = props.excludeDomains?.length ? { domainFilter: { exclude: props.excludeDomains } } : {};
 
@@ -143,34 +167,58 @@ export class WebSearchGatewayStack extends cdk.Stack {
       gateway.node.addDependency(role);
       addWebSearchTarget(gateway, "ApiKey");
 
+      const rules: wafv2.CfnWebACL.RuleProperty[] = [];
+      const visibility = (metricName: string) => ({ cloudWatchMetricsEnabled: true, metricName, sampledRequestsEnabled: true });
+
+      if (allowedCidrs.length > 0) {
+        // 許可リストに含まれない送信元をすべてブロックする。IP セットは IPv4 と IPv6 で別リソースになる
+        const ipSetRefs = (["IPV4", "IPV6"] as const)
+          .map((version) => ({ version, addresses: version === "IPV4" ? allowed.ipv4 : allowed.ipv6 }))
+          .filter((x) => x.addresses.length > 0)
+          .map(({ version, addresses }) => ({
+            ipSetReferenceStatement: {
+              arn: new wafv2.CfnIPSet(this, `ApiKeyGatewayAllowed${version}`, {
+                scope: "REGIONAL",
+                ipAddressVersion: version,
+                addresses,
+              }).attrArn,
+            },
+          }));
+        rules.push({
+          name: "BlockNotAllowedIps",
+          priority: 0,
+          action: { block: {} },
+          statement: {
+            notStatement: {
+              statement: ipSetRefs.length === 1 ? ipSetRefs[0] : { orStatement: { statements: ipSetRefs } },
+            },
+          },
+          visibilityConfig: visibility("BlockNotAllowedIps"),
+        });
+      }
       if (props.enableWaf ?? true) {
+        rules.push({
+          name: "RateLimitPerIp",
+          priority: 1,
+          action: { block: {} },
+          statement: {
+            rateBasedStatement: {
+              aggregateKeyType: "IP",
+              evaluationWindowSec: 300,
+              limit: props.wafRequestsPer5MinPerIp ?? 300,
+            },
+          },
+          visibilityConfig: visibility("RateLimitPerIp"),
+        });
+      }
+
+      // IP 制限には WAF が必要なので、enableWaf=false でも allowedIps があれば Web ACL を作る
+      if (rules.length > 0) {
         const webAcl = new wafv2.CfnWebACL(this, "ApiKeyGatewayWebAcl", {
           scope: "REGIONAL",
           defaultAction: { allow: {} },
-          visibilityConfig: {
-            cloudWatchMetricsEnabled: true,
-            metricName: `${this.stackName}-apikey-gateway`,
-            sampledRequestsEnabled: true,
-          },
-          rules: [
-            {
-              name: "RateLimitPerIp",
-              priority: 0,
-              action: { block: {} },
-              statement: {
-                rateBasedStatement: {
-                  aggregateKeyType: "IP",
-                  evaluationWindowSec: 300,
-                  limit: props.wafRequestsPer5MinPerIp ?? 300,
-                },
-              },
-              visibilityConfig: {
-                cloudWatchMetricsEnabled: true,
-                metricName: "RateLimitPerIp",
-                sampledRequestsEnabled: true,
-              },
-            },
-          ],
+          visibilityConfig: visibility(`${this.stackName}-apikey-gateway`),
+          rules,
         });
         new wafv2.CfnWebACLAssociation(this, "ApiKeyGatewayWebAclAssociation", {
           resourceArn: gateway.attrGatewayArn,
@@ -192,6 +240,26 @@ export class WebSearchGatewayStack extends cdk.Stack {
       });
       gateway.node.addDependency(role);
       addWebSearchTarget(gateway, "Iam");
+
+      if (allowedCidrs.length > 0) {
+        // 明示的な Deny は呼び出し元の IAM 権限（管理者を含む）より優先されるため、許可リスト外からは誰も呼び出せない
+        new agentcore.CfnResourcePolicy(this, "IamGatewayResourcePolicy", {
+          resourceArn: gateway.attrGatewayArn,
+          policy: cdk.Stack.of(this).toJsonString({
+            Version: "2012-10-17",
+            Statement: [
+              {
+                Sid: "DenyNotAllowedIps",
+                Effect: "Deny",
+                Principal: "*",
+                Action: "bedrock-agentcore:InvokeGateway",
+                Resource: gateway.attrGatewayArn,
+                Condition: { NotIpAddress: { "aws:SourceIp": allowedCidrs } },
+              },
+            ],
+          }),
+        });
+      }
 
       // 呼び出し側に付与するためのポリシー（ユーザーやロールにアタッチして使う）
       const invokePolicy = new iam.ManagedPolicy(this, "IamGatewayInvokePolicy", {

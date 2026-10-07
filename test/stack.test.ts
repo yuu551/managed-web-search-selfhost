@@ -1,7 +1,7 @@
 import * as cdk from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import { describe, expect, it } from "vitest";
-import { WebSearchGatewayStack, WebSearchGatewayStackProps } from "../lib/web-search-gateway-stack";
+import { classifyCidrs, WebSearchGatewayStack, WebSearchGatewayStackProps } from "../lib/web-search-gateway-stack";
 
 const synth = (props: Partial<WebSearchGatewayStackProps> = {}, region = "us-east-1") => {
   const app = new cdk.App();
@@ -106,6 +106,49 @@ describe("WebSearchGatewayStack", () => {
     t.hasResourceProperties("AWS::BedrockAgentCore::GatewayRateLimit", {
       DimensionKeys: ["toolName"],
       Entries: [{ Dimensions: { toolName: "web-search___WebSearch" }, Requests: [{ Rate: 30, Period: "minute" }] }],
+    });
+  });
+
+  it("classifies IPv4 / IPv6 CIDRs and rejects invalid entries", () => {
+    expect(classifyCidrs(["203.0.113.10", "198.51.100.0/24", "2001:db8::1", "2001:db8::/32"])).toEqual({
+      ipv4: ["203.0.113.10/32", "198.51.100.0/24"],
+      ipv6: ["2001:db8::1/128", "2001:db8::/32"],
+    });
+    for (const bad of ["10.0.0.0/33", "2001:db8::/129", "example.com", "10.0.0.0/8/1", "10.0.0.0/x"]) {
+      expect(() => classifyCidrs([bad])).toThrow(/Invalid CIDR/);
+    }
+  });
+
+  it("restricts the IAM gateway by source IP with a Deny resource policy", () => {
+    const t = synth({ authModes: ["iam"], allowedIps: ["203.0.113.0/24", "2001:db8::/32"] });
+    const [policy] = Object.values(t.findResources("AWS::BedrockAgentCore::ResourcePolicy"));
+    const doc = JSON.stringify(policy.Properties.Policy);
+    expect(doc).toContain('\\"Effect\\":\\"Deny\\"');
+    expect(doc).toContain("NotIpAddress");
+    expect(doc).toContain("203.0.113.0/24");
+    expect(doc).toContain("2001:db8::/32");
+    expect(synth({ authModes: ["iam"] }).findResources("AWS::BedrockAgentCore::ResourcePolicy")).toEqual({});
+  });
+
+  it("restricts the API key gateway with WAF IP sets for IPv4 and IPv6", () => {
+    const t = synth({ authModes: ["apikey"], allowedIps: ["203.0.113.0/24", "2001:db8::/32"] });
+    t.hasResourceProperties("AWS::WAFv2::IPSet", { IPAddressVersion: "IPV4", Addresses: ["203.0.113.0/24"] });
+    t.hasResourceProperties("AWS::WAFv2::IPSet", { IPAddressVersion: "IPV6", Addresses: ["2001:db8::/32"] });
+    t.hasResourceProperties("AWS::WAFv2::WebACL", {
+      Rules: Match.arrayWith([
+        Match.objectLike({
+          Name: "BlockNotAllowedIps",
+          Statement: { NotStatement: { Statement: { OrStatement: { Statements: [Match.anyValue(), Match.anyValue()] } } } },
+        }),
+      ]),
+    });
+  });
+
+  it("still creates a WAF for IP restriction when enableWaf is false", () => {
+    const t = synth({ authModes: ["apikey"], enableWaf: false, allowedIps: ["203.0.113.10"] });
+    t.resourceCountIs("AWS::WAFv2::IPSet", 1);
+    t.hasResourceProperties("AWS::WAFv2::WebACL", {
+      Rules: [Match.objectLike({ Name: "BlockNotAllowedIps", Statement: { NotStatement: { Statement: { IPSetReferenceStatement: Match.anyValue() } } } })],
     });
   });
 
